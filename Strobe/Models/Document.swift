@@ -38,10 +38,27 @@ final class Document {
     /// without deserializing the entire words array.
     var wordCount: Int
 
+    var sourceTypeRaw: String?
+    var audioFileName: String?
+    @Attribute(.externalStorage) var wordTimingsBlob: Data?
+    @Attribute(.externalStorage) var segmentBoundariesBlob: Data?
+    var audioDuration: Double = 0
+    var playbackRate: Double = 1.0
+    var audioOutputOffset: Double = 0
+    var audioContentHash: String?
+
     /// In-memory cache of the decoded words array, invalidated on compaction.
     @Transient private var cachedWords: [String]?
     /// In-memory cache of decoded complexity scores.
     @Transient private var cachedComplexity: [Float]?
+    @Transient private var cachedWordTimings: [Double]?
+    @Transient private var cachedSegmentBoundaries: [Int]?
+
+    var sourceType: DocumentSourceType {
+        sourceTypeRaw.flatMap(DocumentSourceType.init(rawValue:)) ?? .unknown
+    }
+
+    var isAudiobook: Bool { sourceType == .audiobook }
 
     /// The document's words, resolved from `wordsBlob` (preferred) or the legacy `words` array.
     /// Results are cached in memory for the lifetime of the model object.
@@ -105,6 +122,28 @@ final class Document {
             ComplexityStorage.decode(blob)
         }.value
         cachedComplexity = decoded
+        return decoded
+    }
+
+    func loadWordTimingsAsync() async -> [Double]? {
+        if let cachedWordTimings { return cachedWordTimings }
+        guard let wordTimingsBlob, !wordTimingsBlob.isEmpty else { return nil }
+        let blob = wordTimingsBlob
+        let decoded = await Task.detached(priority: .userInitiated) {
+            WordTimingStorage.decode(blob)
+        }.value
+        cachedWordTimings = decoded
+        return decoded
+    }
+
+    func loadSegmentBoundariesAsync() async -> [Int]? {
+        if let cachedSegmentBoundaries { return cachedSegmentBoundaries }
+        guard let segmentBoundariesBlob, !segmentBoundariesBlob.isEmpty else { return nil }
+        let blob = segmentBoundariesBlob
+        let decoded = await Task.detached(priority: .userInitiated) {
+            SegmentBoundaryStorage.decode(blob)
+        }.value
+        cachedSegmentBoundaries = decoded
         return decoded
     }
 
@@ -218,5 +257,42 @@ final class Document {
         self.furthestWordIndex = 0
         self.wordsPerMinute = wordsPerMinute
         self.dateAdded = Date()
+    }
+
+    init(
+        id: UUID,
+        audiobookTitle: String,
+        fileName: String,
+        wordsBlob: Data,
+        wordCount: Int,
+        wordsPerMinute: Int,
+        audioFileName: String,
+        wordTimingsBlob: Data,
+        segmentBoundariesBlob: Data,
+        audioDuration: Double,
+        audioOutputOffset: Double,
+        audioContentHash: String
+    ) {
+        self.id = id
+        self.title = audiobookTitle
+        self.fileName = fileName
+        self.bookmarkData = Data()
+        self.wordsBlob = wordsBlob
+        self.complexityBlob = nil
+        self.words = []
+        self.chapters = []
+        self.wordCount = wordCount
+        self.currentWordIndex = 0
+        self.furthestWordIndex = 0
+        self.wordsPerMinute = wordsPerMinute
+        self.dateAdded = Date()
+        self.sourceTypeRaw = DocumentSourceType.audiobook.rawValue
+        self.audioFileName = audioFileName
+        self.wordTimingsBlob = wordTimingsBlob
+        self.segmentBoundariesBlob = segmentBoundariesBlob
+        self.audioDuration = audioDuration
+        self.playbackRate = 1.0
+        self.audioOutputOffset = audioOutputOffset
+        self.audioContentHash = audioContentHash
     }
 }

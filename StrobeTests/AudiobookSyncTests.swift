@@ -106,4 +106,38 @@ struct AudiobookSyncTests {
         )
         #expect(timeline.index(at: 1.5) == 1)
     }
+
+    // MARK: - Document audiobook fields
+
+    @MainActor
+    @Test func audiobookDocumentInitStoresAudioFields() {
+        let timings = [0.0, 0.5, 1.0]
+        let doc = Document(
+            id: UUID(),
+            audiobookTitle: "The Hobbit",
+            fileName: "the-hobbit.mp3",
+            wordsBlob: WordStorage.encode(["In", "a", "hole"]),
+            wordCount: 3,
+            wordsPerMinute: 300,
+            audioFileName: "abc.mp3",
+            wordTimingsBlob: WordTimingStorage.encode(timings),
+            segmentBoundariesBlob: SegmentBoundaryStorage.encode([0]),
+            audioDuration: 120,
+            audioOutputOffset: 0.1,
+            audioContentHash: "hash"
+        )
+        #expect(doc.sourceType == .audiobook)
+        #expect(doc.isAudiobook)
+        #expect(doc.playbackRate == 1.0)
+        #expect(doc.audioDuration == 120)
+        #expect(doc.readingWords == ["In", "a", "hole"])
+        #expect(WordTimingStorage.decode(doc.wordTimingsBlob ?? Data()) == timings)
+    }
+
+    @MainActor
+    @Test func legacyDocumentIsNotAudiobook() {
+        let doc = Document(title: "T", fileName: "t.txt", bookmarkData: Data(), words: ["a"])
+        #expect(!doc.isAudiobook)
+        #expect(doc.sourceType == .unknown)
+    }
 }

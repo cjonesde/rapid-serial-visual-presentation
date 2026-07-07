@@ -6,6 +6,7 @@ enum DocumentSourceType: String, Equatable {
     case pdf
     case epub
     case plainText
+    case audiobook
     case unknown
 }
 
@@ -129,7 +130,7 @@ enum DocumentImportPipeline {
             let complexity = WordComplexityAnalyzer.analyzeComplexity(words)
             try Task.checkCancellation()
             return ImportResult(words: words, complexityScores: complexity, chapters: [], sourceType: .plainText, title: nil)
-        case .unknown:
+        case .audiobook, .unknown:
             throw DocumentImportError.unsupportedFileType
         }
     }
