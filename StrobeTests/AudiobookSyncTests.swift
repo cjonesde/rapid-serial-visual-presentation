@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import SwiftData
 @testable import Strobe
 
 struct AudiobookSyncTests {
@@ -429,6 +430,180 @@ struct AudiobookSyncTests {
         #expect(coordinator.outputOffset == 1.0)
         coordinator.outputOffset = -0.5
         #expect(coordinator.outputOffset == 0.0)
+    }
+
+    // MARK: - Import fixtures
+
+    private func makeWAVFile(duration: TimeInterval = 2.0) throws -> URL {
+        let sampleRate = 8000
+        let frameCount = Int(duration * Double(sampleRate))
+        let dataSize = frameCount * 2
+        var bytes = Data()
+        func ascii(_ s: String) { bytes.append(s.data(using: .ascii)!) }
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { bytes.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { bytes.append(contentsOf: $0) } }
+        ascii("RIFF"); u32(UInt32(36 + dataSize)); ascii("WAVE")
+        ascii("fmt "); u32(16); u16(1); u16(1)
+        u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 2)); u16(2); u16(16)
+        ascii("data"); u32(UInt32(dataSize))
+        bytes.append(Data(count: dataSize))
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("strobe-test-\(UUID().uuidString).wav")
+        try bytes.write(to: url)
+        return url
+    }
+
+    private func writeTimingFile(_ json: Data) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("strobe-test-\(UUID().uuidString).json")
+        try json.write(to: url)
+        return url
+    }
+
+    private func makeTempDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("strobe-audio-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    @MainActor
+    private func makeInMemoryContainer() throws -> ModelContainer {
+        let config = ModelConfiguration(isStoredInMemoryOnly: true)
+        return try ModelContainer(for: Document.self, configurations: config)
+    }
+
+    // MARK: - AudiobookImporter (AC-I6, I7, I8, I11, I12)
+
+    @Test func classifyPairIsOrderIndependent() throws {
+        let wav = try makeWAVFile()
+        let timing = try writeTimingFile(Self.exampleTimingJSON)
+        let a = try AudiobookImporter.classifyPair([wav, timing])
+        #expect(a.audio == wav && a.timing == timing)
+        let b = try AudiobookImporter.classifyPair([timing, wav])
+        #expect(b.audio == wav && b.timing == timing)
+        #expect(throws: DocumentImportError.audiobookPairRequired) {
+            try AudiobookImporter.classifyPair([wav])
+        }
+        #expect(throws: DocumentImportError.audiobookPairRequired) {
+            try AudiobookImporter.classifyPair([wav, wav])
+        }
+    }
+
+    @MainActor
+    @Test func prepareBuildsPreviewFromValidPair() async throws {
+        let wav = try makeWAVFile(duration: 2.0)
+        let timing = try writeTimingFile(Self.exampleTimingJSON)
+        let preview = try await AudiobookImporter.prepare(audioURL: wav, timingURL: timing)
+        #expect(preview.wordCount == 6)
+        #expect(preview.segmentCount == 2)
+        #expect(preview.previewWords == ["In", "a", "hole", "in", "the", "ground"])
+        #expect(abs(preview.audioDuration - 2.0) < 0.1)
+        #expect(!preview.contentHash.isEmpty)
+        #expect(WordStorage.decode(preview.wordsBlob) == ["In", "a", "hole", "in", "the", "ground"])
+    }
+
+    @MainActor
+    @Test func prepareRejectsCorruptAudio() async throws {
+        let corrupt = FileManager.default.temporaryDirectory
+            .appendingPathComponent("strobe-test-\(UUID().uuidString).mp3")
+        try Data(repeating: 0xAB, count: 4096).write(to: corrupt)
+        let timing = try writeTimingFile(Self.exampleTimingJSON)
+        await #expect(throws: DocumentImportError.audioCorrupt) {
+            _ = try await AudiobookImporter.prepare(audioURL: corrupt, timingURL: timing)
+        }
+    }
+
+    @MainActor
+    @Test func invalidTimingRejectedInPrepare() async throws {
+        let wav = try makeWAVFile()
+        let badTiming = try writeTimingFile("{\"version\": 3, \"segments\": []}".data(using: .utf8)!)
+        await #expect(throws: DocumentImportError.unsupportedTimingVersion) {
+            _ = try await AudiobookImporter.prepare(audioURL: wav, timingURL: badTiming)
+        }
+    }
+
+    @MainActor
+    @Test func commitCreatesOneSelfContainedDocument() async throws {
+        let container = try makeInMemoryContainer()
+        let context = container.mainContext
+        let baseDir = try makeTempDirectory()
+        let wav = try makeWAVFile()
+        let timing = try writeTimingFile(Self.exampleTimingJSON)
+        let preview = try await AudiobookImporter.prepare(audioURL: wav, timingURL: timing)
+        let doc = try AudiobookImporter.commit(preview: preview, defaultWPM: 300, baseDirectory: baseDir) {
+            context.insert($0)
+            try context.save()
+        }
+        let all = try context.fetch(FetchDescriptor<Document>())
+        #expect(all.count == 1)
+        #expect(doc.sourceType == .audiobook)
+        #expect(doc.wordCount == 6)
+        #expect(doc.playbackRate == 1.0)
+        #expect(abs(doc.audioDuration - 2.0) < 0.1)
+        #expect(doc.audioOutputOffset >= 0 && doc.audioOutputOffset <= 1.0)
+        #expect(WordTimingStorage.decode(doc.wordTimingsBlob ?? Data()) == [0.42, 0.55, 0.61, 0.94, 1.02, 1.10])
+        #expect(SegmentBoundaryStorage.decode(doc.segmentBoundariesBlob ?? Data()) == [0, 3])
+        let audioFile = AudiobookLibrary.audioURL(fileName: doc.audioFileName ?? "", in: baseDir)
+        #expect(FileManager.default.fileExists(atPath: audioFile.path))
+    }
+
+    @MainActor
+    @Test func failedInsertRemovesPartialCopyAndCreatesNothing() async throws {
+        let container = try makeInMemoryContainer()
+        let context = container.mainContext
+        let baseDir = try makeTempDirectory()
+        let wav = try makeWAVFile()
+        let timing = try writeTimingFile(Self.exampleTimingJSON)
+        let preview = try await AudiobookImporter.prepare(audioURL: wav, timingURL: timing)
+        struct Boom: Error {}
+        #expect(throws: Boom.self) {
+            try AudiobookImporter.commit(preview: preview, defaultWPM: 300, baseDirectory: baseDir) { _ in
+                throw Boom()
+            }
+        }
+        let all = try context.fetch(FetchDescriptor<Document>())
+        #expect(all.isEmpty)
+        let contents = try FileManager.default.contentsOfDirectory(atPath: baseDir.path)
+        #expect(contents.isEmpty)
+    }
+
+    @MainActor
+    @Test func duplicateContentHashIsDetectableAcrossImports() async throws {
+        let container = try makeInMemoryContainer()
+        let context = container.mainContext
+        let baseDir = try makeTempDirectory()
+        let wav = try makeWAVFile()
+        let timing = try writeTimingFile(Self.exampleTimingJSON)
+        let first = try await AudiobookImporter.prepare(audioURL: wav, timingURL: timing)
+        _ = try AudiobookImporter.commit(preview: first, defaultWPM: 300, baseDirectory: baseDir) {
+            context.insert($0)
+            try context.save()
+        }
+        let second = try await AudiobookImporter.prepare(audioURL: wav, timingURL: timing)
+        #expect(second.contentHash == first.contentHash)
+        let existing = try context.fetch(FetchDescriptor<Document>())
+        #expect(existing.contains { $0.audioContentHash == second.contentHash })
+        _ = try AudiobookImporter.commit(preview: second, defaultWPM: 300, baseDirectory: baseDir) {
+            context.insert($0)
+            try context.save()
+        }
+        let all = try context.fetch(FetchDescriptor<Document>())
+        #expect(all.count == 2)
+        let audioFiles = Set(all.compactMap(\.audioFileName))
+        #expect(audioFiles.count == 2)
+    }
+
+    @MainActor
+    @Test func removeAudioDeletesCopiedFile() async throws {
+        let baseDir = try makeTempDirectory()
+        let wav = try makeWAVFile()
+        let docID = UUID()
+        let name = try AudiobookLibrary.copyAudio(from: wav, documentID: docID, into: baseDir)
+        let copied = AudiobookLibrary.audioURL(fileName: name, in: baseDir)
+        #expect(FileManager.default.fileExists(atPath: copied.path))
+        AudiobookLibrary.removeAudio(fileName: name, from: baseDir)
+        #expect(!FileManager.default.fileExists(atPath: copied.path))
     }
 }
 
