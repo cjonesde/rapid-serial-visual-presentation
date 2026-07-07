@@ -63,4 +63,47 @@ struct AudiobookSyncTests {
         #expect(WordTimeline.clampRate(1.25) == 1.25)
         #expect(timeline.averageWPM(duration: 0) == 0)
     }
+
+    // MARK: - SegmentTimeline (AC-U10)
+
+    @Test func segmentTimelineResolvesLikeWordTimelineWhenSingleSegment() {
+        let timeline = SegmentTimeline(
+            wordTimeline: WordTimeline(starts: [0.0, 0.5, 1.0, 2.0]),
+            segmentBoundaries: [0]
+        )
+        #expect(timeline.index(at: 0.6) == 1)
+        #expect(timeline.index(at: 2.5) == 3)
+        #expect(timeline.time(ofWordAt: 2) == 1.0)
+    }
+
+    @Test func segmentReanchoringBoundsWithinSegmentError() {
+        let timeline = SegmentTimeline(
+            wordTimeline: WordTimeline(starts: [0.0, 0.0, 0.0, 5.0, 5.5, 6.0]),
+            segmentBoundaries: [0, 3]
+        )
+        let before = timeline.index(at: 4.9)
+        #expect(before >= 0 && before < 3)
+        #expect(timeline.index(at: 5.0) == 3)
+        #expect(timeline.index(at: 5.6) == 4)
+    }
+
+    @Test func segmentTimelineCorruptTimesCannotEscapeSegment() {
+        let timeline = SegmentTimeline(
+            wordTimeline: WordTimeline(starts: [0.0, 9.0, 9.0, 5.0, 5.5, 6.0]),
+            segmentBoundaries: [0, 3]
+        )
+        for t in stride(from: 0.0, through: 4.9, by: 0.7) {
+            let idx = timeline.index(at: t)
+            #expect(idx >= 0 && idx < 3)
+        }
+        #expect(timeline.index(at: 5.1) == 3)
+    }
+
+    @Test func segmentTimelineEmptyBoundariesActsAsSingleSegment() {
+        let timeline = SegmentTimeline(
+            wordTimeline: WordTimeline(starts: [0.0, 1.0]),
+            segmentBoundaries: []
+        )
+        #expect(timeline.index(at: 1.5) == 1)
+    }
 }
