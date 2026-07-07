@@ -42,6 +42,12 @@ struct ReaderView: View {
     @State private var persistenceError: String?
     @State private var isLoaded = false
     @State private var isBackfillingComplexity = false
+    @State private var coordinator: AudioSyncCoordinator?
+    @State private var audioClock: AVPlaybackClock?
+    @State private var audioTimeline: SegmentTimeline?
+    @State private var isAudioUnavailable = false
+    @State private var rateSliderValue: Double
+    @State private var isAdjustingRate = false
     @FocusState private var readerFocused: Bool
 
     private let startingWordIndex: Int?
@@ -72,6 +78,7 @@ struct ReaderView: View {
             complexityIntensity: timing.complexityIntensity
         ))
         self._wpmSliderValue = State(initialValue: Double(document.wordsPerMinute))
+        self._rateSliderValue = State(initialValue: WordTimeline.clampRate(document.playbackRate))
     }
 
     /// Decodes the word and complexity blobs (off-main) and hands them to the
@@ -89,9 +96,48 @@ struct ReaderView: View {
         if engine.isAtEnd && engine.words.count > 1 {
             showCompletion = true
         }
-        if scores == nil && complexityTimingEnabled {
+        if document.isAudiobook {
+            await configureAudioPlayback()
+        } else if scores == nil && complexityTimingEnabled {
             backfillComplexityScores()
         }
+    }
+
+    private func configureAudioPlayback() async {
+        guard let fileName = document.audioFileName,
+              let baseDirectory = try? AudiobookLibrary.defaultBaseDirectory() else {
+            isAudioUnavailable = true
+            return
+        }
+        let url = AudiobookLibrary.audioURL(fileName: fileName, in: baseDirectory)
+        guard FileManager.default.fileExists(atPath: url.path),
+              let timings = await document.loadWordTimingsAsync(),
+              let boundaries = await document.loadSegmentBoundariesAsync(),
+              !timings.isEmpty,
+              timings.count == engine.words.count else {
+            isAudioUnavailable = true
+            return
+        }
+        let timeline = SegmentTimeline(
+            wordTimeline: WordTimeline(starts: timings),
+            segmentBoundaries: boundaries
+        )
+        let clock = AVPlaybackClock(url: url)
+        let syncCoordinator = AudioSyncCoordinator(
+            clock: clock,
+            timeline: timeline,
+            engine: engine,
+            outputOffset: document.audioOutputOffset,
+            rate: document.playbackRate
+        )
+        syncCoordinator.onExternalPause = { _ in
+            persistState(pauseEngine: false, touchLastReadDate: false)
+        }
+        audioClock = clock
+        audioTimeline = timeline
+        coordinator = syncCoordinator
+        rateSliderValue = syncCoordinator.rate
+        syncCoordinator.seekAudio(toWordIndex: engine.currentIndex)
     }
 
     /// Computes and stores complexity scores for documents imported before
@@ -132,6 +178,8 @@ struct ReaderView: View {
                 if showCompletion {
                     completionView
                         .transition(reduceMotion ? .opacity : .scale.combined(with: .opacity))
+                } else if isAudioUnavailable {
+                    audioUnavailableView
                 } else {
                     CurrentWordView(engine: engine, fontSize: CGFloat(fontSize))
                     .id("wordview") // stabilize identity
@@ -152,6 +200,11 @@ struct ReaderView: View {
                     .animation(.easeInOut(duration: 0.2), value: engine.isPlaying)
             }
             .animation(.easeInOut(duration: 0.2), value: engine.isPlaying)
+            .alert("Audio Error", isPresented: audioErrorPresented) {
+                Button("OK") { coordinator?.clearTransientError() }
+            } message: {
+                Text(coordinator?.transientError ?? "")
+            }
         }
         #if os(iOS)
         .toolbar(.hidden, for: .navigationBar)
@@ -172,6 +225,8 @@ struct ReaderView: View {
         }
         .onDisappear {
             persistState(pauseEngine: true, touchLastReadDate: true)
+            audioClock?.invalidate()
+            engine.playbackController = nil
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .inactive || newPhase == .background {
@@ -218,7 +273,7 @@ struct ReaderView: View {
             engine.complexityTimingEnabled = newValue
             // The setting can be flipped on mid-session (macOS Settings
             // window) for a legacy document with no stored scores.
-            if newValue && isLoaded && engine.complexityScores == nil {
+            if newValue && isLoaded && engine.complexityScores == nil && !document.isAudiobook {
                 backfillComplexityScores()
             }
         }
@@ -295,6 +350,13 @@ struct ReaderView: View {
         showPassage || showChapterPicker || persistenceError != nil
     }
 
+    private var audioErrorPresented: Binding<Bool> {
+        Binding(
+            get: { coordinator?.transientError != nil },
+            set: { if !$0 { coordinator?.clearTransientError() } }
+        )
+    }
+
     // MARK: - Unified gesture
 
     private var unifiedGesture: some Gesture {
@@ -349,7 +411,7 @@ struct ReaderView: View {
                         engine.pause()
                         HapticManager.shared.playPause()
                     }
-                } else if !wasScrubbing && !showCompletion {
+                } else if !wasScrubbing && !showCompletion && !isAudioUnavailable {
                     // Tap-to-toggle mode: a release without a horizontal swipe
                     // counts as a tap. Toggle playback.
                     if engine.isPlaying {
@@ -374,7 +436,7 @@ struct ReaderView: View {
         cancelPlayIntent()
 
         let workItem = DispatchWorkItem {
-            guard isTouching, touchMode == .undecided, !showCompletion else { return }
+            guard isTouching, touchMode == .undecided, !showCompletion, !isAudioUnavailable else { return }
             touchMode = .reading
             if !engine.isPlaying {
                 if engine.isAtEnd {
@@ -397,6 +459,7 @@ struct ReaderView: View {
     /// Shared play/pause toggle used by the Space key and the VoiceOver
     /// custom action, so playback isn't gesture-only.
     private func togglePlayback() {
+        guard !isAudioUnavailable else { return }
         if engine.isPlaying {
             engine.pause()
         } else if engine.isAtEnd {
@@ -463,7 +526,17 @@ struct ReaderView: View {
             .allowsHitTesting(!engine.isPlaying)
             
             Spacer().frame(height: 20)
-            
+
+            if document.isAudiobook {
+                audioRateControl
+            } else {
+                wpmControl
+            }
+        }
+        .animation(.easeInOut(duration: navFadeDuration), value: engine.isPlaying)
+    }
+
+    private var wpmControl: some View {
             // WPM Control
             HStack {
                 Text("\(displayedWPM)")
@@ -497,8 +570,79 @@ struct ReaderView: View {
             // during playback land on the invisible slider instead of the
             // gesture layer (and can silently change the reading speed).
             .allowsHitTesting(!engine.isPlaying)
+    }
+
+    private var audioRateControl: some View {
+        HStack {
+            Text("\(audioDisplayedWPM)")
+                .font(StrobeTheme.bodyFont(size: 24, bold: true))
+                .foregroundStyle(StrobeTheme.accent)
+                .frame(width: 80)
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text("wpm")
+                    .font(StrobeTheme.bodyFont(size: 14))
+                    .foregroundStyle(StrobeTheme.textSecondary)
+                Text(String(format: "%.2fx", rateSliderValue))
+                    .font(StrobeTheme.bodyFont(size: 11))
+                    .foregroundStyle(StrobeTheme.textSecondary)
+            }
+
+            Slider(value: $rateSliderValue, in: WordTimeline.minRate...WordTimeline.maxRate, step: 0.05) { editing in
+                isAdjustingRate = editing
+                if !editing {
+                    applyRate(rateSliderValue, withHaptic: true)
+                }
+            }
+            .tint(StrobeTheme.accent)
+            .frame(minHeight: 44)
+            .accessibilityLabel("Playback speed")
+            .accessibilityValue("\(audioDisplayedWPM) words per minute at \(String(format: "%.2f", rateSliderValue)) times speed")
         }
-        .animation(.easeInOut(duration: navFadeDuration), value: engine.isPlaying)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 12)
+        .background(StrobeTheme.surface.opacity(0.8))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .padding(.horizontal)
+        .opacity(engine.isPlaying ? 0.0 : 1.0)
+        .allowsHitTesting(!engine.isPlaying)
+    }
+
+    private var audioDisplayedWPM: Int {
+        WordTimeline.displayedWPM(
+            wordCount: document.wordCount,
+            duration: document.audioDuration,
+            rate: rateSliderValue
+        )
+    }
+
+    private func applyRate(_ value: Double, withHaptic: Bool) {
+        guard let coordinator else { return }
+        coordinator.setRate(value)
+        rateSliderValue = coordinator.rate
+        document.playbackRate = coordinator.rate
+        if withHaptic {
+            HapticManager.shared.selectionTick()
+        }
+    }
+
+    private var audioUnavailableView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "headphones")
+                .font(.system(size: 40))
+                .foregroundStyle(StrobeTheme.accent)
+            Text("Audio Missing")
+                .font(StrobeTheme.titleFont(size: 24))
+                .foregroundStyle(StrobeTheme.textPrimary)
+            Text("The audio file for this book could not be found. Delete the document and import it again.")
+                .font(StrobeTheme.bodyFont(size: 15))
+                .foregroundStyle(StrobeTheme.textSecondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(32)
+        .background(StrobeTheme.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 24))
+        .padding(.horizontal, 24)
     }
 
     // MARK: - Bottom bar
@@ -523,6 +667,10 @@ struct ReaderView: View {
                 showCompletion: $showCompletion
             )
 
+            if document.isAudiobook, coordinator != nil {
+                audioSyncNudge
+            }
+
             Text(hintText)
                 .font(StrobeTheme.bodyFont(size: 14))
                 .foregroundStyle(StrobeTheme.textSecondary)
@@ -531,6 +679,32 @@ struct ReaderView: View {
         .padding(.horizontal, 24)
         .padding(.bottom, 20)
         .constrainedAndCentered(maxWidth: controlsMaxWidth)
+    }
+
+    private var audioSyncNudge: some View {
+        HStack(spacing: 12) {
+            Text("Audio sync")
+                .font(StrobeTheme.bodyFont(size: 13))
+                .foregroundStyle(StrobeTheme.textSecondary)
+            Spacer()
+            CircleIconButton(systemImage: "minus", accessibilityLabel: "Decrease audio offset") {
+                adjustOutputOffset(by: -0.025)
+            }
+            Text("\(Int(((coordinator?.outputOffset ?? 0) * 1000).rounded())) ms")
+                .font(StrobeTheme.bodyFont(size: 13, bold: true))
+                .foregroundStyle(StrobeTheme.textPrimary)
+                .frame(width: 64)
+            CircleIconButton(systemImage: "plus", accessibilityLabel: "Increase audio offset") {
+                adjustOutputOffset(by: 0.025)
+            }
+        }
+    }
+
+    private func adjustOutputOffset(by delta: TimeInterval) {
+        guard let coordinator else { return }
+        coordinator.outputOffset += delta
+        document.audioOutputOffset = coordinator.outputOffset
+        HapticManager.shared.selectionTick()
     }
 
     // MARK: - Completion view
@@ -625,6 +799,14 @@ struct ReaderView: View {
         if isAdjustingWPM {
             isAdjustingWPM = false
             applyWPM(Int(wpmSliderValue), withHaptic: false)
+        }
+        if isAdjustingRate {
+            isAdjustingRate = false
+            applyRate(rateSliderValue, withHaptic: false)
+        }
+        if document.isAudiobook, let coordinator {
+            document.playbackRate = coordinator.rate
+            document.audioOutputOffset = coordinator.outputOffset
         }
         if pauseEngine {
             cancelPlayIntent()
