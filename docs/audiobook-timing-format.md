@@ -2,6 +2,8 @@
 
 Strobe's audiobook sync pairs a DRM-free audio file with a companion timing file that maps every spoken word to its onset time. The app only consumes this file; generating it happens on another device (see Generation below).
 
+A ready-to-import example pair lives in [`examples/gettysburg-address/`](examples/gettysburg-address/).
+
 ## Schema
 
 Hierarchical segment-and-word JSON, version 2:
