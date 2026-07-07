@@ -140,4 +140,87 @@ struct AudiobookSyncTests {
         #expect(!doc.isAudiobook)
         #expect(doc.sourceType == .unknown)
     }
+
+    // MARK: - AudiobookTimingParser (AC-U5 to AC-U9)
+
+    static let exampleTimingJSON = """
+    {
+      "version": 2,
+      "audio": "the-hobbit.mp3",
+      "language": "en",
+      "segments": [
+        { "s": 0.42, "words": [
+          { "w": "In", "s": 0.42 }, { "w": "a", "s": 0.55 }, { "w": "hole", "s": 0.61 } ] },
+        { "s": 0.94, "words": [
+          { "w": "in", "s": 0.94 }, { "w": "the", "s": 1.02 }, { "w": "ground", "s": 1.10 } ] }
+      ]
+    }
+    """.data(using: .utf8)!
+
+    @Test func parserAcceptsValidV2File() throws {
+        let parsed = try AudiobookTimingParser.parse(Self.exampleTimingJSON, audioDuration: 100)
+        #expect(parsed.words == ["In", "a", "hole", "in", "the", "ground"])
+        #expect(parsed.segmentBoundaries == [0, 3])
+        #expect(parsed.wordStarts == [0.42, 0.55, 0.61, 0.94, 1.02, 1.10])
+        #expect(parsed.language == "en")
+    }
+
+    @Test func parserRejectsUnknownVersion() {
+        for version in [1, 3] {
+            let json = "{\"version\": \(version), \"segments\": [{\"s\": 0, \"words\": [{\"w\": \"a\", \"s\": 0}]}]}".data(using: .utf8)!
+            #expect(throws: DocumentImportError.unsupportedTimingVersion) {
+                try AudiobookTimingParser.parse(json, audioDuration: 100)
+            }
+        }
+    }
+
+    @Test func parserRejectsMalformedInput() {
+        let cases: [Data] = [
+            "not json".data(using: .utf8)!,
+            "{\"version\": 2, \"segments\": []}".data(using: .utf8)!,
+            "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": []}]}".data(using: .utf8)!,
+            "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": [{\"s\": 0}]}]}".data(using: .utf8)!,
+            "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": [{\"w\": \"a\"}]}]}".data(using: .utf8)!
+        ]
+        for data in cases {
+            #expect(throws: DocumentImportError.malformedTimings) {
+                try AudiobookTimingParser.parse(data, audioDuration: 100)
+            }
+        }
+    }
+
+    @Test func parserRejectsNonMonotonicAllowsEqual() throws {
+        let decreasing = "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": [{\"w\": \"a\", \"s\": 0.0}, {\"w\": \"b\", \"s\": 0.5}, {\"w\": \"c\", \"s\": 0.4}]}]}".data(using: .utf8)!
+        #expect(throws: DocumentImportError.nonMonotonicTimings) {
+            try AudiobookTimingParser.parse(decreasing, audioDuration: 100)
+        }
+        let outOfOrderSegments = "{\"version\": 2, \"segments\": [{\"s\": 5.0, \"words\": [{\"w\": \"a\", \"s\": 5.0}]}, {\"s\": 1.0, \"words\": [{\"w\": \"b\", \"s\": 1.0}]}]}".data(using: .utf8)!
+        #expect(throws: DocumentImportError.nonMonotonicTimings) {
+            try AudiobookTimingParser.parse(outOfOrderSegments, audioDuration: 100)
+        }
+        let equal = "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": [{\"w\": \"a\", \"s\": 0.0}, {\"w\": \"b\", \"s\": 0.5}, {\"w\": \"c\", \"s\": 0.5}]}]}".data(using: .utf8)!
+        let parsed = try AudiobookTimingParser.parse(equal, audioDuration: 100)
+        #expect(parsed.wordStarts == [0.0, 0.5, 0.5])
+    }
+
+    @Test func parserRejectsNegativeAndOverlongTimings() throws {
+        let negative = "{\"version\": 2, \"segments\": [{\"s\": -1.0, \"words\": [{\"w\": \"a\", \"s\": -1.0}]}]}".data(using: .utf8)!
+        #expect(throws: DocumentImportError.nonMonotonicTimings) {
+            try AudiobookTimingParser.parse(negative, audioDuration: 100)
+        }
+        let overlong = "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": [{\"w\": \"a\", \"s\": 0.0}, {\"w\": \"b\", \"s\": 103.0}]}]}".data(using: .utf8)!
+        #expect(throws: DocumentImportError.timingsExceedAudio) {
+            try AudiobookTimingParser.parse(overlong, audioDuration: 100.0, tolerance: 2.0)
+        }
+        let withinTolerance = "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": [{\"w\": \"a\", \"s\": 0.0}, {\"w\": \"b\", \"s\": 101.5}]}]}".data(using: .utf8)!
+        let parsed = try AudiobookTimingParser.parse(withinTolerance, audioDuration: 100.0, tolerance: 2.0)
+        #expect(parsed.wordStarts.last == 101.5)
+    }
+
+    @Test func parserRejectsWordsContainingNewlines() {
+        let newline = "{\"version\": 2, \"segments\": [{\"s\": 0, \"words\": [{\"w\": \"a\\nb\", \"s\": 0.0}]}]}".data(using: .utf8)!
+        #expect(throws: DocumentImportError.malformedTimings) {
+            try AudiobookTimingParser.parse(newline, audioDuration: 100)
+        }
+    }
 }
