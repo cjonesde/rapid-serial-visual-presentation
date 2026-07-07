@@ -58,8 +58,11 @@ the next hold plays at the document's configured WPM (existing behavior).
 ### Feedback
 
 - Transient WPM readout ("420 WPM", theme `bodyFont`, secondary text color)
-  near the word while `wpmOverride != nil`, fading in/out. Implemented as a
-  per-tick child view per the existing invalidation-scoping pattern.
+  below the word while `wpmOverride != nil`. Every speed step restarts a 2s
+  idle window; once the speed has not changed for 2s, the readout fades out
+  over 1s, and the next speed change fades it back in. Release fades it out
+  quickly. Implemented as a per-tick child view per the existing
+  invalidation-scoping pattern.
 - Haptic step ticks via the existing `scrubTick()` (no-op on macOS).
 
 ## Testing (Swift Testing, TDD)
