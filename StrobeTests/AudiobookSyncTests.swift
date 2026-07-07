@@ -272,4 +272,208 @@ struct AudiobookSyncTests {
         engine.setIndexFromAudio(99)
         #expect(engine.currentIndex == 2)
     }
+
+    // MARK: - AudioSyncCoordinator (AC-U11, AC-I1 to I5, I9, I10, I13)
+
+    @MainActor
+    private func makeCoordinatorRig(
+        starts: [Double] = [0.0, 0.5, 1.0, 2.0],
+        boundaries: [Int] = [0],
+        outputOffset: TimeInterval = 0
+    ) -> (engine: RSVPEngine, clock: FakePlaybackClock, coordinator: AudioSyncCoordinator) {
+        let words = (0..<starts.count).map { "w\($0)" }
+        let engine = RSVPEngine(words: words, wordsPerMinute: 6000)
+        let clock = FakePlaybackClock()
+        let timeline = SegmentTimeline(wordTimeline: WordTimeline(starts: starts), segmentBoundaries: boundaries)
+        let coordinator = AudioSyncCoordinator(clock: clock, timeline: timeline, engine: engine, outputOffset: outputOffset, rate: 1.0)
+        return (engine, clock, coordinator)
+    }
+
+    @Test func effectiveTimeSubtractsOffsetClampedAtZero() {
+        #expect(abs(AudioSyncCoordinator.effectiveTime(currentTime: 0.6, outputOffset: 0.2) - 0.4) < 1e-9)
+        #expect(AudioSyncCoordinator.effectiveTime(currentTime: 0.1, outputOffset: 0.2) == 0.0)
+    }
+
+    @MainActor
+    @Test func coordinatorTickSetsIndexMatchingCurrentTime() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        _ = coordinator
+        clock.tick(at: 0.6)
+        #expect(engine.currentIndex == 1)
+        clock.tick(at: 2.0)
+        #expect(engine.currentIndex == 3)
+    }
+
+    @MainActor
+    @Test func coordinatorAppliesOutputOffsetOnTicks() {
+        let (engine, clock, coordinator) = makeCoordinatorRig(outputOffset: 0.2)
+        _ = coordinator
+        clock.tick(at: 0.6)
+        #expect(engine.currentIndex == 0)
+        clock.tick(at: 0.71)
+        #expect(engine.currentIndex == 1)
+    }
+
+    @MainActor
+    @Test func uiSeekDrivesClockViaWordIndex() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        _ = coordinator
+        engine.seek(to: 2)
+        #expect(clock.seekTargets == [1.0])
+        #expect(engine.currentIndex == 2)
+    }
+
+    @MainActor
+    @Test func playPauseDelegateToClock() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        _ = coordinator
+        engine.play()
+        #expect(clock.playCallCount == 1)
+        engine.pause()
+        #expect(clock.pauseCallCount == 1)
+    }
+
+    @MainActor
+    @Test func rateIsClampedAndForwarded() {
+        let (_, clock, coordinator) = makeCoordinatorRig()
+        coordinator.setRate(5.0)
+        #expect(clock.rate == 3.0)
+        #expect(coordinator.rate == 3.0)
+        coordinator.setRate(0.1)
+        #expect(clock.rate == 0.5)
+    }
+
+    @MainActor
+    @Test func interruptionPausesAndReportsIndex() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        var reportedIndex: Int?
+        coordinator.onExternalPause = { reportedIndex = $0 }
+        engine.play()
+        clock.tick(at: 0.6)
+        clock.onDidInterrupt?()
+        #expect(clock.pauseCallCount >= 1)
+        #expect(!engine.isPlaying)
+        #expect(reportedIndex == 1)
+    }
+
+    @MainActor
+    @Test func failedSeekRestoresLastGoodIndexAndSurfacesError() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        clock.tick(at: 0.6)
+        #expect(engine.currentIndex == 1)
+        clock.seekBehavior = .fail
+        engine.seek(to: 3)
+        #expect(engine.currentIndex == 1)
+        #expect(coordinator.transientError != nil)
+    }
+
+    @MainActor
+    @Test func delayedSeekIgnoresStaleTicksUntilCompletion() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        _ = coordinator
+        clock.seekBehavior = .delayed
+        engine.seek(to: 3)
+        #expect(engine.currentIndex == 3)
+        clock.tick(at: 0.0)
+        #expect(engine.currentIndex == 3)
+        clock.completeNextSeek(success: true)
+        clock.tick(at: 2.0)
+        #expect(engine.currentIndex == 3)
+        clock.tick(at: 0.6)
+        #expect(engine.currentIndex == 1)
+    }
+
+    @MainActor
+    @Test func staleSeekCompletionIsIgnoredAfterNewerSeek() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        clock.seekBehavior = .delayed
+        engine.seek(to: 1)
+        engine.seek(to: 3)
+        clock.completeNextSeek(success: false)
+        #expect(coordinator.transientError == nil)
+        #expect(engine.currentIndex == 3)
+        clock.completeNextSeek(success: true)
+        #expect(engine.currentIndex == 3)
+    }
+
+    @MainActor
+    @Test func coordinatorReanchorsAcrossSegmentBoundary() {
+        let (engine, clock, coordinator) = makeCoordinatorRig(
+            starts: [0.0, 9.0, 9.0, 5.0, 5.5, 6.0],
+            boundaries: [0, 3]
+        )
+        _ = coordinator
+        for t in stride(from: 0.0, through: 4.9, by: 0.35) {
+            clock.tick(at: t)
+            #expect(engine.currentIndex >= 0 && engine.currentIndex < 3)
+        }
+        clock.tick(at: 5.2)
+        #expect(engine.currentIndex == 3)
+    }
+
+    @MainActor
+    @Test func endOfItemPausesAtLastWord() {
+        let (engine, clock, coordinator) = makeCoordinatorRig()
+        _ = coordinator
+        engine.play()
+        clock.onDidReachEnd?()
+        #expect(engine.currentIndex == 3)
+        #expect(engine.isAtEnd)
+        #expect(!engine.isPlaying)
+    }
+
+    @MainActor
+    @Test func outputOffsetIsClamped() {
+        let (_, _, coordinator) = makeCoordinatorRig()
+        coordinator.outputOffset = 5.0
+        #expect(coordinator.outputOffset == 1.0)
+        coordinator.outputOffset = -0.5
+        #expect(coordinator.outputOffset == 0.0)
+    }
+}
+
+@MainActor
+final class FakePlaybackClock: PlaybackClock {
+    var currentTime: TimeInterval = 0
+    var rate: Double = 1.0
+    var onTick: ((TimeInterval) -> Void)?
+    var onDidReachEnd: (() -> Void)?
+    var onDidFail: ((String) -> Void)?
+    var onDidInterrupt: (() -> Void)?
+
+    enum SeekBehavior { case succeed, fail, delayed }
+    var seekBehavior: SeekBehavior = .succeed
+
+    private(set) var playCallCount = 0
+    private(set) var pauseCallCount = 0
+    private(set) var seekTargets: [TimeInterval] = []
+    private var pendingSeeks: [(target: TimeInterval, completion: (Bool) -> Void)] = []
+
+    func play() { playCallCount += 1 }
+    func pause() { pauseCallCount += 1 }
+
+    func seek(to time: TimeInterval, completion: @escaping (Bool) -> Void) {
+        seekTargets.append(time)
+        switch seekBehavior {
+        case .succeed:
+            currentTime = time
+            completion(true)
+        case .fail:
+            completion(false)
+        case .delayed:
+            pendingSeeks.append((time, completion))
+        }
+    }
+
+    func completeNextSeek(success: Bool) {
+        guard !pendingSeeks.isEmpty else { return }
+        let pending = pendingSeeks.removeFirst()
+        if success { currentTime = pending.target }
+        pending.completion(success)
+    }
+
+    func tick(at time: TimeInterval) {
+        currentTime = time
+        onTick?(time)
+    }
 }
