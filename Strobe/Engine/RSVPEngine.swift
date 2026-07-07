@@ -1,5 +1,11 @@
 import Foundation
 
+protocol RSVPPlaybackController: AnyObject {
+    func enginePlay()
+    func enginePause()
+    func engineSeek(toWordIndex index: Int)
+}
+
 /// Drives the word-by-word Rapid Serial Visual Presentation playback.
 ///
 /// Manages a timer that advances through the word array at the configured
@@ -56,6 +62,8 @@ final class RSVPEngine {
 
     /// Pre-computed complexity scores, parallel to the `words` array. Nil for legacy documents.
     private(set) var complexityScores: [Float]?
+
+    weak var playbackController: (any RSVPPlaybackController)?
 
     /// The word at the current playback position, or an empty string if out of bounds.
     var currentWord: String {
@@ -131,17 +139,28 @@ final class RSVPEngine {
     func play() {
         guard !isPlaying, !words.isEmpty, !isAtEnd else { return }
         isPlaying = true
-        scheduleNextWord()
+        if let playbackController {
+            playbackController.enginePlay()
+        } else {
+            scheduleNextWord()
+        }
     }
 
     /// Stops playback and invalidates the timer.
     func pause() {
         isPlaying = false
         stopTimer()
+        playbackController?.enginePause()
     }
 
     /// Jumps to a specific word index, clamped to valid bounds.
     func seek(to index: Int) {
+        currentIndex = max(0, min(index, words.count - 1))
+        playbackController?.engineSeek(toWordIndex: currentIndex)
+    }
+
+    func setIndexFromAudio(_ index: Int) {
+        guard !words.isEmpty else { return }
         currentIndex = max(0, min(index, words.count - 1))
     }
 
@@ -159,7 +178,7 @@ final class RSVPEngine {
     }
 
     private func onPlaybackSettingChanged() {
-        guard isPlaying else { return }
+        guard isPlaying, playbackController == nil else { return }
         guard let source = timerSource, let scheduled = scheduledDeadline else {
             scheduleNextWord()
             return

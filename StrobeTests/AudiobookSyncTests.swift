@@ -223,4 +223,53 @@ struct AudiobookSyncTests {
             try AudiobookTimingParser.parse(newline, audioDuration: 100)
         }
     }
+
+    // MARK: - RSVPEngine playback controller seam
+
+    @MainActor
+    private final class ControllerSpy: RSVPPlaybackController {
+        var playCalls = 0
+        var pauseCalls = 0
+        var seekCalls: [Int] = []
+        func enginePlay() { playCalls += 1 }
+        func enginePause() { pauseCalls += 1 }
+        func engineSeek(toWordIndex index: Int) { seekCalls.append(index) }
+    }
+
+    @MainActor
+    @Test func engineWithControllerNeverSchedulesTimer() async throws {
+        let engine = RSVPEngine(words: ["a", "b", "c"], wordsPerMinute: 6000)
+        let spy = ControllerSpy()
+        engine.playbackController = spy
+        engine.play()
+        #expect(engine.isPlaying)
+        #expect(spy.playCalls == 1)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(engine.currentIndex == 0)
+        engine.pause()
+        #expect(!engine.isPlaying)
+        #expect(spy.pauseCalls == 1)
+    }
+
+    @MainActor
+    @Test func engineSeekNotifiesControllerWithClampedIndex() {
+        let engine = RSVPEngine(words: ["a", "b", "c"])
+        let spy = ControllerSpy()
+        engine.playbackController = spy
+        engine.seek(to: 99)
+        #expect(engine.currentIndex == 2)
+        #expect(spy.seekCalls == [2])
+    }
+
+    @MainActor
+    @Test func setIndexFromAudioDoesNotNotifyController() {
+        let engine = RSVPEngine(words: ["a", "b", "c"])
+        let spy = ControllerSpy()
+        engine.playbackController = spy
+        engine.setIndexFromAudio(1)
+        #expect(engine.currentIndex == 1)
+        #expect(spy.seekCalls.isEmpty)
+        engine.setIndexFromAudio(99)
+        #expect(engine.currentIndex == 2)
+    }
 }
