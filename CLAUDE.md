@@ -4,14 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Test
 
-**Do NOT run `xcodebuild` commands.** The user builds and tests separately in Xcode.
-
 The project targets iOS 17.0+ / macOS 14.0+ and uses the `Strobe` scheme. CI runs on GitHub Actions with `macos-26`, testing both an iOS simulator (any available iPhone, selected dynamically) and native macOS.
 
 ### Testing
 Tests use the **Swift Testing** framework (not XCTest):
 - `@Test` for test functions, `#expect` for assertions
-- Test file: `StrobeTests/StrobeTests.swift`
+- Test files: `StrobeTests/StrobeTests.swift`, `StrobeTests/AudiobookSyncTests.swift`
+- The test target does NOT inherit `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` — mark tests touching the engine, coordinator, clocks, or SwiftData models `@MainActor`
 
 ## Architecture
 
@@ -24,6 +23,12 @@ PDF/EPUB/Text → DocumentImportPipeline → Extractor → TextCleaner → Token
                                               Document (SwiftData) ← WordStorage (blob)
                                                                                     ↓
                                                         RSVPEngine → WordView (display)
+
+Audiobook (audio + v2 timing JSON) → AudiobookImporter → AudiobookTimingParser
+    → Document (.audiobook: WordStorage + WordTimingStorage + SegmentBoundaryStorage blobs,
+      audio copied to Application Support/Audio/<uuid>.<ext>)
+    → AVPlaybackClock (AVPlayer, 20 Hz ticks) → AudioSyncCoordinator → SegmentTimeline
+    → RSVPEngine.setIndexFromAudio → WordView
 ```
 
 ### Key Layers
@@ -44,6 +49,8 @@ PDF/EPUB/Text → DocumentImportPipeline → Extractor → TextCleaner → Token
 
 **Persistence**: SwiftData `Document` model stores words externally as newline-delimited UTF-8 blob (`WordStorage`) and per-word complexity scores as raw Float binary (`ComplexityStorage`). In-memory caches (`cachedWords`, `cachedComplexity`) avoid repeated deserialization.
 
+**Audiobook sync** (`Engine/`, `Import/`): audio mode inverts the clock — the audio player's position is the source of truth instead of a timer. `RSVPEngine.playbackController` (protocol `RSVPPlaybackController`) is the seam: when set, the engine never schedules its timer and play/pause/seek delegate to `AudioSyncCoordinator`, which drives the index back in via `engine.setIndexFromAudio(_:)` (deliberately separate from `seek(to:)` so ticks don't echo into audio seeks). Position resolves through `SegmentTimeline` (segment by binary search, then word within the segment's range — re-anchoring bounds any timing-file error to one segment); `WordTimeline` holds flat Float64 word onsets. `PlaybackClock` is the protocol seam over `AVPlayer` (`AVPlaybackClock`: pitch-preserving `.spectral`, 20 Hz periodic observer, interruption/route-loss pause on iOS, explicit `invalidate()` teardown); tests use `FakePlaybackClock`. The WPM slider becomes a 0.5x-3x rate control in audio mode (displayed number = narrator average WPM × rate); per-document `audioOutputOffset` (nudge control, 0 to 1 s) compensates output latency (Bluetooth). Import: `AudiobookImporter.prepare` validates the pair (DRM/corrupt/unsupported audio as distinct errors; v2 timing schema via `AudiobookTimingParser`), then `commit` copies audio into Application Support/Audio and inserts one `.audiobook` document atomically (a failed insert removes the copy; deleting a document removes its copy after a successful save). Timing format + generation guide: `docs/audiobook-timing-format.md`. Pitch, interruption/route/background behavior, end-to-end latency, and Bluetooth offset are device-only manual checks; the latency logger is the DEBUG tick log in `AudioSyncCoordinator` (os.Logger category `AudioSync`).
+
 ### Xcode Project
 Uses `PBXFileSystemSynchronizedRootGroup` — Xcode auto-mirrors the on-disk folder structure. Moving files on disk is sufficient; no `project.pbxproj` edits needed.
 
@@ -51,9 +58,12 @@ Uses `PBXFileSystemSynchronizedRootGroup` — Xcode auto-mirrors the on-disk fol
 ```
 Strobe/
 ├── App/          App entry point, SwiftData container bootstrap
-├── Engine/       RSVPEngine (playback), Tokenizer (word splitting), WordComplexityAnalyzer
-├── Import/       DocumentImportPipeline, extractors, TextCleaner, ZIPExtractor
-├── Models/       SwiftData models (Document, Chapter, WordStorage, ComplexityStorage)
+├── Engine/       RSVPEngine (playback), Tokenizer (word splitting), WordComplexityAnalyzer,
+│                 WordTimeline, SegmentTimeline, PlaybackClock, AVPlaybackClock, AudioSyncCoordinator
+├── Import/       DocumentImportPipeline, extractors, TextCleaner, ZIPExtractor,
+│                 AudiobookImporter, AudiobookTimingParser, AudiobookLibrary
+├── Models/       SwiftData models (Document, Chapter, WordStorage, ComplexityStorage,
+│                 WordTimingStorage, SegmentBoundaryStorage)
 ├── Views/        All SwiftUI views
 ├── Theme/        StrobeTheme (colors, typography, hex parser)
 ├── Utilities/    HapticManager, ReaderFont
@@ -67,7 +77,7 @@ Strobe/
 - **Logging**: `os.Logger` with subsystem/category
 - **Theme**: Dark mode only, background `0x050505`, accent "Strobe Red" `#FF3B30`
 - **Typography**: Fraunces (`titleFont`) for headings and for large display numerals in Settings cards (WPM, text size — `titleFont(size: 32)` in `textPrimary`); body text and captions use `bodyFont`. Keep sibling numerals styled identically.
-- **Error types**: `DocumentImportError` enum (`unsupportedFileType`, `epubExtractionFailed`, `epubDRMProtected`, `pdfLoadFailed`, `pdfPasswordProtected`, `noReadableText`)
+- **Error types**: `DocumentImportError` enum (`unsupportedFileType`, `epubExtractionFailed`, `epubDRMProtected`, `pdfLoadFailed`, `pdfPasswordProtected`, `noReadableText`, plus audiobook cases `unsupportedTimingVersion`, `malformedTimings`, `nonMonotonicTimings`, `timingsExceedAudio`, `audioProtected`, `audioCorrupt`, `audioUnsupported`, `audioCopyFailed`, `audiobookPairRequired`)
 - **Settings keys**: `defaultWPM`, `fontSize`, `smartTimingEnabled`, `sentencePauseEnabled`, `smartTimingPercentPerLetter`, `sentencePauseMultiplier`, `complexityTimingEnabled`, `complexityIntensity`, `holdToReadEnabled`, `readerFontSelection`, `textCleaningLevel` — all registered in `ReaderSettings.Keys` (plus app flags `hasSeenTutorial`, `didCompactLegacyWordStorage`); never use raw key strings
 - **Navigation**: value-based (`NavigationLink(value:)` + `navigationDestination` in `ContentView`, `ReaderRoute` for chapter entries) — eager `destination:` links would decode word blobs for every visible row. `ReaderView` loads word blobs asynchronously in `.task`, never in `init`.
 - **Platform conditionals**: `#if os(iOS)` / `#if os(macOS)` for UIKit/AppKit imports, haptics, presentation modifiers, and hint text. Engine, import pipeline, and models are fully cross-platform.
