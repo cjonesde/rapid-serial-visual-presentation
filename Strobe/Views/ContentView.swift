@@ -27,6 +27,11 @@ struct ContentView: View {
     @State private var showTextInput = false
     @State private var documentPendingDeletion: Document?
     @State private var documentPendingRename: Document?
+    @State private var isImportingAudiobook = false
+    @State private var audiobookPreview: AudiobookImportPreview?
+    @State private var audiobookDuplicate: Document?
+    @State private var pendingDuplicatePreview: AudiobookImportPreview?
+    @State private var audiobookScopedURLs: [URL] = []
     @State private var renameText = ""
     @State private var searchText = ""
     @State private var isDropTargeted = false
@@ -150,6 +155,54 @@ struct ContentView: View {
             ) { result in
                 handleImport(result)
             }
+            .background(
+                Color.clear
+                    .fileImporter(
+                        isPresented: $isImportingAudiobook,
+                        allowedContentTypes: [.audio, .json],
+                        allowsMultipleSelection: true
+                    ) { result in
+                        handleAudiobookImport(result)
+                    }
+            )
+            .sheet(item: $audiobookPreview) { preview in
+                AudiobookImportPreviewView(
+                    preview: preview,
+                    onConfirm: { confirmAudiobookImport(preview) },
+                    onCancel: { cancelAudiobookImport() }
+                )
+                #if os(iOS)
+                .presentationDetents([.large])
+                .presentationCornerRadius(24)
+                #elseif os(macOS)
+                .frame(minWidth: 500, minHeight: 560)
+                #endif
+            }
+            .alert(
+                "Already in Library",
+                isPresented: .init(isPresent: $audiobookDuplicate),
+                presenting: audiobookDuplicate
+            ) { existing in
+                Button("Replace") {
+                    if let preview = pendingDuplicatePreview {
+                        commitAudiobook(preview, replacing: existing)
+                    }
+                    audiobookDuplicate = nil
+                }
+                Button("Keep Both") {
+                    if let preview = pendingDuplicatePreview {
+                        commitAudiobook(preview, replacing: nil)
+                    }
+                    audiobookDuplicate = nil
+                }
+                Button("Cancel", role: .cancel) {
+                    audiobookDuplicate = nil
+                    pendingDuplicatePreview = nil
+                    stopAudiobookScopes()
+                }
+            } message: { existing in
+                Text("This audio matches \"\(existing.title)\". Replace it or keep both?")
+            }
             .overlay {
                 if isProcessingImport {
                     importOverlay
@@ -189,11 +242,16 @@ struct ContentView: View {
                 presenting: documentPendingDeletion
             ) { doc in
                 Button("Delete", role: .destructive) {
+                    let audioFileName = doc.audioFileName
                     modelContext.delete(doc)
                     // Surfaced because a silently failed save rolls the delete
                     // back — the document would reappear on next launch with
                     // no explanation.
-                    saveOrReport("Could not delete the document")
+                    if saveOrReport("Could not delete the document"),
+                       let audioFileName,
+                       let baseDirectory = try? AudiobookLibrary.defaultBaseDirectory() {
+                        AudiobookLibrary.removeAudio(fileName: audioFileName, from: baseDirectory)
+                    }
                     documentPendingDeletion = nil
                 }
                 Button("Cancel", role: .cancel) {
@@ -412,6 +470,11 @@ struct ContentView: View {
                 Label("Import File", systemImage: "doc.fill")
             }
             Button {
+                isImportingAudiobook = true
+            } label: {
+                Label("Import Audiobook", systemImage: "headphones")
+            }
+            Button {
                 showTextInput = true
             } label: {
                 Label("Enter Text", systemImage: "text.cursor")
@@ -439,11 +502,14 @@ struct ContentView: View {
     /// Saves the model context, surfacing failures in the Save Error alert
     /// (mirrors `ReaderView.persistState` — `try?` here silently rolled the
     /// change back on next launch).
-    private func saveOrReport(_ what: String) {
+    @discardableResult
+    private func saveOrReport(_ what: String) -> Bool {
         do {
             try modelContext.save()
+            return true
         } catch {
             persistenceError = "\(what): \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -663,6 +729,103 @@ extension ContentView {
         }
     }
 
+    private func handleAudiobookImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard !urls.isEmpty else { return }
+            beginAudiobookImport(urls: urls)
+        case .failure(let error):
+            importError = error.localizedDescription
+        }
+    }
+
+    private func beginAudiobookImport(urls: [URL]) {
+        guard !isProcessingImport else {
+            importError = "Another import is still in progress. Wait for it to finish or cancel it first."
+            return
+        }
+        audiobookScopedURLs = urls.filter { $0.startAccessingSecurityScopedResource() }
+        isProcessingImport = true
+        importFileName = urls.first?.lastPathComponent ?? "audiobook"
+        importTask = Task(priority: .userInitiated) {
+            defer {
+                isProcessingImport = false
+                importFileName = ""
+                importTask = nil
+            }
+            do {
+                let pair = try AudiobookImporter.classifyPair(urls)
+                let preview = try await AudiobookImporter.prepare(
+                    audioURL: pair.audio,
+                    timingURL: pair.timing
+                )
+                audiobookPreview = preview
+            } catch is CancellationError {
+                stopAudiobookScopes()
+            } catch {
+                stopAudiobookScopes()
+                if let localizedError = error as? LocalizedError,
+                   let message = localizedError.errorDescription {
+                    importError = message
+                } else {
+                    importError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func confirmAudiobookImport(_ preview: AudiobookImportPreview) {
+        audiobookPreview = nil
+        if let existing = documents.first(where: { $0.audioContentHash == preview.contentHash }) {
+            pendingDuplicatePreview = preview
+            audiobookDuplicate = existing
+            return
+        }
+        commitAudiobook(preview, replacing: nil)
+    }
+
+    private func cancelAudiobookImport() {
+        audiobookPreview = nil
+        stopAudiobookScopes()
+    }
+
+    private func commitAudiobook(_ preview: AudiobookImportPreview, replacing existing: Document?) {
+        pendingDuplicatePreview = nil
+        do {
+            let baseDirectory = try AudiobookLibrary.defaultBaseDirectory()
+            if let existing {
+                let oldAudio = existing.audioFileName
+                modelContext.delete(existing)
+                if let oldAudio {
+                    AudiobookLibrary.removeAudio(fileName: oldAudio, from: baseDirectory)
+                }
+            }
+            _ = try AudiobookImporter.commit(
+                preview: preview,
+                defaultWPM: defaultWPM,
+                baseDirectory: baseDirectory
+            ) { document in
+                modelContext.insert(document)
+                try modelContext.save()
+            }
+        } catch {
+            if let localizedError = error as? LocalizedError,
+               let message = localizedError.errorDescription {
+                importError = message
+            } else {
+                importError = error.localizedDescription
+            }
+        }
+        stopAudiobookScopes()
+    }
+
+    private func stopAudiobookScopes() {
+        for url in audiobookScopedURLs {
+            url.stopAccessingSecurityScopedResource()
+        }
+        audiobookScopedURLs = []
+    }
+
     private func compactLegacyWordStorageIfNeeded() {
         // One-time pass. Touching `wordsBlob`/`words` on every document
         // faults every row (and can pull external blobs) on the main thread —
@@ -736,7 +899,7 @@ struct DocumentCard: View {
                     .fill(StrobeTheme.accent.opacity(0.1))
                     .frame(width: 48, height: 48)
 
-                Image(systemName: "text.book.closed.fill")
+                Image(systemName: document.isAudiobook ? "headphones" : "text.book.closed.fill")
                     .font(.system(size: 20))
                     .foregroundStyle(StrobeTheme.accent)
             }
