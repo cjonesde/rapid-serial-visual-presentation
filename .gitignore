@@ -62,3 +62,5 @@ fastlane/screenshots/**/*.png
 fastlane/test_output
 
 pdfs/
+# br doctor per-run artifacts
+.doctor/
