@@ -136,6 +136,13 @@ struct ReaderView: View {
                     CurrentWordView(engine: engine, fontSize: CGFloat(fontSize))
                     .id("wordview") // stabilize identity
                     .transition(.opacity)
+                    // Overlay (not a sibling) so the word never shifts when
+                    // the readout appears.
+                    .overlay {
+                        HoldSpeedReadoutView(engine: engine)
+                            .offset(y: CGFloat(fontSize) * 1.4)
+                            .accessibilityHidden(true)
+                    }
                     // The word display sits above the gesture layer; without
                     // this, holding directly on the word would swallow the
                     // hold-to-read gesture.
@@ -323,6 +330,22 @@ struct ReaderView: View {
                     }
                 }
 
+                if touchMode == .reading {
+                    // Vertical drag while holding adjusts speed live. The
+                    // override is nil inside the dead zone so the readout
+                    // only appears once the finger commits to adjusting.
+                    guard engine.isPlaying else { return }
+                    let base = engine.wordsPerMinute
+                    let mapped = RSVPEngine.holdSpeedWPM(
+                        baseWPM: base,
+                        verticalTranslation: value.translation.height
+                    )
+                    if mapped != engine.effectiveWordsPerMinute {
+                        engine.wpmOverride = mapped == base ? nil : mapped
+                        HapticManager.shared.scrubTick()
+                    }
+                }
+
                 if touchMode == .scrubbing {
                     // Scrubbing is a paused-only interaction.
                     guard !engine.isPlaying else { return }
@@ -344,6 +367,9 @@ struct ReaderView: View {
                 let wasScrubbing = touchMode == .scrubbing
                 isTouching = false
                 cancelPlayIntent()
+                // pause() clears the override; this covers the not-playing
+                // edge case (e.g. the document ended mid-hold).
+                engine.wpmOverride = nil
                 if holdToReadEnabled {
                     if engine.isPlaying {
                         engine.pause()
@@ -667,6 +693,33 @@ private struct CurrentWordView: View {
     var body: some View {
         WordView(word: engine.currentWord, fontSize: fontSize)
             .equatable()
+    }
+}
+
+/// The transient speed readout shown while a hold-to-read vertical drag
+/// has an active WPM override. Isolates the per-change speed read.
+/// Every speed step restarts a 2s idle window; once idle, the readout
+/// fades out over 1s. Release (nil override) fades it quickly.
+private struct HoldSpeedReadoutView: View {
+    let engine: RSVPEngine
+    @State private var isVisible = false
+
+    var body: some View {
+        Text("\(engine.effectiveWordsPerMinute) WPM")
+            .font(StrobeTheme.bodyFont(size: 14))
+            .monospacedDigit()
+            .foregroundStyle(StrobeTheme.textSecondary)
+            .opacity(isVisible ? 1 : 0)
+            .task(id: engine.wpmOverride) {
+                guard engine.wpmOverride != nil else {
+                    withAnimation(.easeInOut(duration: 0.2)) { isVisible = false }
+                    return
+                }
+                withAnimation(.easeInOut(duration: 0.2)) { isVisible = true }
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeOut(duration: 1)) { isVisible = false }
+            }
     }
 }
 
